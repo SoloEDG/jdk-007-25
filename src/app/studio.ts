@@ -1,9 +1,14 @@
 import { createEngine, bindPerformanceInput } from "@/features/instruments";
-import { createTransport, scheduleWindow } from "@/features/transport";
+import {
+  createTransport,
+  createPlaybackIndex,
+  type PlaybackIndex,
+} from "@/features/transport";
 import { createRecorder } from "@/features/recorder";
 import {
   createArrangement,
   demoSession,
+  largeDemoSession,
   saveSession,
   loadSession,
 } from "@/features/arrangement";
@@ -18,7 +23,9 @@ export function createStudio(notify: () => void) {
   const active = new Set<string>();
   let message = "欢迎来到夜航。戴上耳机，试着敲下第一拍。",
     epoch = 0,
-    disposed = false;
+    disposed = false,
+    index: PlaybackIndex | null = null,
+    indexRevision = -1;
   const now = () => engine.context?.currentTime ?? 0;
   const feedback = (text: string) => {
     message = text;
@@ -36,6 +43,29 @@ export function createStudio(notify: () => void) {
   };
   const syncMixer = () =>
     mixer.ensure(arrangement.snapshot().tracks.map((t) => t.id));
+  /**
+   * 回放索引按作品修订号缓存：滚动、切轨、暂停恢复都不会重建它。
+   * 索引覆盖全部 64 条轨道，与当前可见行完全无关。
+   */
+  const playbackIndex = () => {
+    const revision = arrangement.revision();
+    if (!index || revision !== indexRevision) {
+      index = createPlaybackIndex(arrangement.playbackTracks());
+      indexRevision = revision;
+    }
+    return index;
+  };
+  /** 轨道顺序 / 优先级变化后，让已排队的声部也按新排序被淘汰。 */
+  const priorityMap = () =>
+    Object.fromEntries(
+      arrangement
+        .playbackTracks()
+        .map((track, order) => [
+          track.id,
+          { order, priority: track.priority },
+        ]),
+    );
+  const syncPriorities = () => engine.reloadPriorities(priorityMap());
   const cancelVoices = () => {
     engine.cancel();
     active.clear();
@@ -86,16 +116,20 @@ export function createStudio(notify: () => void) {
     const ceiling =
       capture.status === "idle" ? Infinity : capture.start + capture.length;
     const window = transport.window(time, ceiling);
-    if (window)
-      scheduleWindow(
-        arrangement.forPlayback(),
+    // 先把自然结束的声部归还，再把本窗口的声音一起送进预算。
+    engine.sweep(time);
+    if (window) {
+      const muted = new Set(mixer.mutedIds());
+      const groups = playbackIndex().query(
         window.from,
         window.to,
         view.beats,
         view.bpm,
         window.timeAt,
-        (n) => engine.play(n),
+        muted,
       );
+      for (const group of groups) engine.playGroup(group);
+    }
   };
   const down = async (id: string, note: NoteInput) => {
     if (active.has(id)) return;
@@ -113,14 +147,17 @@ export function createStudio(notify: () => void) {
       const take = recorder.advance(abs);
       if (take) arrangement.commit(take.trackId, take.notes);
       recorder.down(id, note, abs);
-      engine.play(
+      engine.playLive(
         {
           ...note,
           trackId: target.id,
           duration: note.instrument === "keys" ? 6 : 0.3,
           when: now(),
+          priority: 9,
+          order: arrangement.indexOf(target.id),
         },
         id,
+        recorder.voiceClass() === "recording",
       );
     } catch {
       active.delete(id);
@@ -138,6 +175,7 @@ export function createStudio(notify: () => void) {
     const valid = arrangement.restore(session);
     transport.configure(valid.bpm, valid.beats);
     mixer.restore(valid.channels, valid.master);
+    syncPriorities();
     notify();
   };
   const timer = window.setInterval(() => {
@@ -163,12 +201,22 @@ export function createStudio(notify: () => void) {
   window.addEventListener("blur", blur);
   return {
     view() {
+      const snapshot = arrangement.snapshot();
+      const budget = engine.report(now());
       return {
         transport: transport.view(now()),
-        arrangement: arrangement.snapshot(),
+        arrangement: snapshot,
         selected: arrangement.selected(),
+        selectedIndex: arrangement.indexOf(snapshot.selected),
         recorder: recorder.snapshot(),
         mixer: mixer.snapshot(),
+        budget,
+        limited: new Map(
+          budget.limited.map((entry) => [
+            entry.trackId,
+            { droppedVoices: entry.droppedVoices, reason: entry.reason },
+          ]),
+        ),
         active: new Set(active),
         message,
       };
@@ -188,6 +236,7 @@ export function createStudio(notify: () => void) {
       guard(() => {
         arrangement.add(kind);
         syncMixer();
+        syncPriorities();
       });
     },
     select(id: string) {
@@ -197,23 +246,34 @@ export function createStudio(notify: () => void) {
       arrangement.select(id);
       notify();
     },
+    setPriority(id: string, priority: number) {
+      guard(() => {
+        arrangement.setPriority(id, priority);
+        engine.reloadPriorities(priorityMap());
+        const track = arrangement.snapshot().tracks.find((t) => t.id === id);
+        message = `声部优先级已更新：${track?.name ?? id} P${priority}`;
+      });
+    },
     remove() {
       guard(() => {
         const selected = arrangement.selected();
-        if (selected) {
-          stop();
-          arrangement.remove(selected.id);
-          syncMixer();
-        }
+        if (!selected) return;
+        // 只处理这一条轨道：其它轨道的播放与播放头位置不受影响。
+        if (recorder.target() === selected.id) recorder.cancel();
+        engine.stopTrack(selected.id);
+        arrangement.remove(selected.id);
+        mixer.ensure(arrangement.snapshot().tracks.map((t) => t.id));
+        syncPriorities();
+        message = `已删除 ${selected.name}，声部与声道已归还`;
       });
     },
     clear() {
       guard(() => {
-        const t = arrangement.selected();
-        if (t) {
-          stop();
-          arrangement.clear(t.id);
-        }
+        const selected = arrangement.selected();
+        if (!selected) return;
+        engine.stopTrack(selected.id);
+        arrangement.clear(selected.id);
+        message = `已清空 ${selected.name} 的音符，正在发声的声部已归还`;
       });
     },
     async record() {
@@ -224,6 +284,7 @@ export function createStudio(notify: () => void) {
         if (!(await unlock()) || token !== epoch) return;
         const state = transport.view(now());
         if (!state.running) transport.start(now() + 0.02);
+        // 录音目标固定为轨道 id，不随可见行号或滚动位置变化。
         recorder.arm(
           selected.id,
           selected.instrument,
@@ -249,17 +310,31 @@ export function createStudio(notify: () => void) {
       notify();
     },
     mute(id: string) {
-      mixer.mute(id);
+      const muted = mixer.mute(id);
+      // 静音立即归还该轨道正在发声的声部；录音仍会继续记录输入。
+      if (muted) engine.stopTrack(id);
+      if (recorder.target() === id && muted)
+        message = "该轨道已静音；录音仍在继续记录";
       notify();
     },
     master(n: number) {
       mixer.master(n);
       notify();
     },
+    budget() {
+      return engine.report(now());
+    },
     demo() {
       guard(() => {
         install(demoSession());
         message = "示范已载入 · 点击播放，听听凌晨两点。";
+      });
+    },
+    largeDemo() {
+      guard(() => {
+        install(largeDemoSession());
+        message =
+          "大编制示范已载入 · 32 条轨道远超声部预算，注意看受限标记。";
       });
     },
     save() {
@@ -269,6 +344,7 @@ export function createStudio(notify: () => void) {
         const a = arrangement.snapshot(),
           t = transport.view(now()),
           m = mixer.snapshot();
+        // 保存读取的是完整作品数据，绝不按声部预算裁剪任何音符。
         saveSession({
           version: 1,
           title: a.title,

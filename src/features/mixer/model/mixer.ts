@@ -15,6 +15,7 @@ export function createMixer() {
       master = level(volume);
       sync();
     },
+    /** 轨道增删后同步通道；被删轨道的总线立即释放。 */
     ensure(ids: string[]) {
       channels = Object.fromEntries(
         ids.map((id) => [id, channels[id] ?? { volume: 0.75, muted: false }]),
@@ -30,6 +31,15 @@ export function createMixer() {
       if (channels[id])
         channels[id] = { ...channels[id], muted: !channels[id].muted };
       sync();
+      return channels[id]?.muted ?? false;
+    },
+    muted(id: string) {
+      return channels[id]?.muted ?? false;
+    },
+    mutedIds() {
+      return Object.entries(channels)
+        .filter(([, channel]) => channel.muted)
+        .map(([id]) => id);
     },
     master(value: number) {
       master = level(value);

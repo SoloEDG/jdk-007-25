@@ -1,4 +1,5 @@
 import type { Instrument, Track } from "@/shared/types";
+import { MAX_TRACKS } from "@/shared/constants";
 export function TrackActions({
   selected,
   count,
@@ -16,13 +17,21 @@ export function TrackActions({
 }) {
   return (
     <div className="track-actions">
-      <button disabled={locked || count >= 8} onClick={() => add("drums")}>
+      <button
+        disabled={locked || count >= MAX_TRACKS}
+        onClick={() => add("drums")}
+      >
         ＋ 鼓组轨道
       </button>
-      <button disabled={locked || count >= 8} onClick={() => add("keys")}>
+      <button
+        disabled={locked || count >= MAX_TRACKS}
+        onClick={() => add("keys")}
+      >
         ＋ 琴键轨道
       </button>
-      <span>{count} / 8 轨道</span>
+      <span>
+        {count} / {MAX_TRACKS} 轨道
+      </span>
       <button
         disabled={locked || !selected || !selected.notes.length}
         onClick={clear}
